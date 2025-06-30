@@ -4,10 +4,11 @@ import h5py
 import wandb
 import argparse
 import os
-from train_ascad_bert import BERT_SCA_Model, BertModel, tokenizer
+from train_ascad_bert_improved import BERT_SCA_Model, BertModel, tokenizer
 import matplotlib.pyplot as plt
 import yaml
 from pathlib import Path
+import re
 
 # Define DEVICE constant
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -88,8 +89,8 @@ def predict_batch(model, traces, plaintexts):
 def evaluate_key_rank(model, X_test, plaintexts, keys, key_byte, num_traces, batch_size=100):
     print(f"Evaluating key byte: {key_byte}, Processing {num_traces} traces...")
     ranks = np.zeros((num_traces, 2))
-    key_found = False
-    key_info = {"key_found": False, "found_at_trace": None, "best_rank": 256}
+    key_byte_found = False
+    key_info = {"key_byte_found": False, "found_at_trace": None, "best_rank": 256}
     best_rank_so_far = 256  # Track best rank achieved
     
     for batch_start in range(0, num_traces, batch_size):
@@ -106,10 +107,10 @@ def evaluate_key_rank(model, X_test, plaintexts, keys, key_byte, num_traces, bat
             ranks[idx][0] = idx
             ranks[idx][1] = best_rank_so_far  # Store best rank achieved so far
             
-            if rank == 0 and not key_found:
-                key_found = True
+            if rank == 0 and not key_byte_found:
+                key_byte_found = True
                 key_info.update({
-                    "key_found": True,
+                    "key_byte_found": True,
                     "found_at_trace": idx,
                     "best_rank": 0,
                     "predicted_key": predicted_key,
@@ -117,7 +118,7 @@ def evaluate_key_rank(model, X_test, plaintexts, keys, key_byte, num_traces, bat
                 })
                 print(f"Key found at trace {idx} with rank 0")
     
-    if not key_found:
+    if not key_byte_found:
         print("Key not found within the given traces.")
         key_info["best_rank"] = best_rank_so_far
     
@@ -160,9 +161,19 @@ def plot_key_rank_evolution(ranks):
 # 🚀 New: WandB Initialization Block with Auto-Naming
 def wandb_initialize(args):
     dataset_name = Path(args.dataset_path).stem  # e.g., "ascad-variable-desync50"
-    run_name = f"Byte-{args.key_byte:02d}"        # e.g., Byte-00, Byte-01, ...
+    run_name = f"Byte-{args.key_byte:02d}"
     project_name = f"ascad-bert-key-eval-{dataset_name}"  # Unique project per dataset variant
 
+    # Extract seed from model filename
+    model_filename = Path(args.model_path).name
+    seed = None
+    # Look for seed pattern in filename: seed{number}
+    seed_match = re.search(r'seed(\d+)', model_filename)
+    if seed_match:
+        seed = int(seed_match.group(1))
+        run_name = f"Byte-{args.key_byte:02d}-seed{seed}"
+    # If seed not found, keep run_name as Byte-XX
+    
     wandb.init(
         project=project_name,
         name=run_name,
@@ -171,7 +182,8 @@ def wandb_initialize(args):
             "model_path": args.model_path,
             "num_traces": args.num_traces,
             "batch_size": args.batch_size,
-            "key_byte": args.key_byte
+            "key_byte": args.key_byte,
+            "training_seed": seed  # Add the training seed to wandb config
         }
     )
     return project_name, run_name
@@ -185,13 +197,22 @@ def main():
     parser.add_argument("--key_byte", type=int, default=0, help="Key byte index to evaluate")
     parser.add_argument("--output_csv", type=str, default="rank_results.csv", help="Output CSV file for rank results")
     parser.add_argument("--output_plot", type=str, default="key_rank_evolution.png", help="Output file for rank evolution plot")
+    parser.add_argument("--profiling_mean_path", type=str, default=None, help="Path to profiling mean file")
+    parser.add_argument("--profiling_std_path", type=str, default=None, help="Path to profiling std file")
     args = parser.parse_args()
 
+    # Set default profiling paths if not provided
+    if args.profiling_mean_path is None:
+        model_dir = Path(args.model_path).parent
+        args.profiling_mean_path = str(model_dir / 'profiling_mean.npy')
+    if args.profiling_std_path is None:
+        model_dir = Path(args.model_path).parent
+        args.profiling_std_path = str(model_dir / 'profiling_std.npy')
 
     wandb_initialize(args)
 
-
     print("Loading model...")
+    X_test, plaintexts, keys = load_test_data(args.dataset_path, args.profiling_mean_path, args.profiling_std_path)
     bert_model = BertModel.from_pretrained('bert-base-uncased')
     model = BERT_SCA_Model(bert_model, trace_length=X_test.shape[1])
     # Load the state dict with proper error handling
@@ -208,8 +229,6 @@ def main():
         raise
         
     model = model.to(DEVICE)
-    
-    X_test, plaintexts, keys = load_test_data(args.dataset_path, 'profiling_mean.npy', 'profiling_std.npy')
     
     ranks, key_info = evaluate_key_rank(
         model, X_test, plaintexts, keys, args.key_byte, args.num_traces, args.batch_size
@@ -248,22 +267,24 @@ def main():
         "min_rank": float(min(r[1] for r in processed_ranks)),
         "max_rank": float(max(r[1] for r in processed_ranks)),
         "avg_rank": float(np.mean([r[1] for r in processed_ranks])),
-        "key_found": key_info["key_found"],
+        "key_byte_found": key_info["key_byte_found"],
         "found_at_trace": key_info["found_at_trace"],
         "best_rank": key_info["best_rank"]
     })
     
     # Print final results
     print("\nFinal Results:")
-    print(f"Best rank achieved: {key_info['best_rank']}")   
-    print(f"Final rank: {processed_ranks[-1][1]}")
-    if key_info["key_found"]:
-        print(f"Key found at trace {key_info['found_at_trace']}")
-        print(f"Predicted key: 0x{key_info['predicted_key']:02x}")
-        print(f"Real key: 0x{key_info['real_key']:02x}")
+    print(f"Key byte index attacked: {args.key_byte}")
+    print(f"Best rank achieved: {key_info['best_rank']}")
+    if key_info.get("key_byte_found"):
+        print(f"Key byte found at trace {key_info['found_at_trace']}")
+        if "predicted_key" in key_info and "real_key" in key_info:
+            print(f"Predicted key byte: 0x{key_info['predicted_key']:02x}")
+            print(f"Real key byte: 0x{key_info['real_key']:02x}")
+    else:
+        print("Key byte not found in the given traces.")
     
-    wandb.finish()
-        # Save evaluation config
+    # Save evaluation config BEFORE wandb.finish()
     eval_config = {
         "dataset_path": args.dataset_path,
         "model_path": args.model_path,
@@ -273,13 +294,25 @@ def main():
         "embedding": "hex",  # adjust as needed
         "backbone": "bert-base-uncased",
         "trace_net": "fc",
-        "fusion": "concat"
+        "fusion": "concat",
+        "best_rank": key_info['best_rank'],
+        "key_byte_found": key_info['key_byte_found'],
+        "found_at_trace": key_info.get('found_at_trace'),
+        "final_rank": float(processed_ranks[-1][1]) if processed_ranks else None
     }
 
-    eval_config_path = os.path.splitext(args.model_path)[0] + "_eval_config.yaml"
-    with open(eval_config_path, 'w') as f:
-        yaml.dump(eval_config, f)
-    print(f"✅ Evaluation config saved to {eval_config_path}")
+    # Save to the same directory as the model
+    model_dir = Path(args.model_path).parent
+    eval_config_path = model_dir / f"{Path(args.model_path).stem}_eval_config.yaml"
+    
+    try:
+        with open(eval_config_path, 'w') as f:
+            yaml.dump(eval_config, f)
+        print(f"✅ Evaluation config saved to {eval_config_path}")
+    except Exception as e:
+        print(f"⚠️ Failed to save evaluation config: {e}")
+    
+    wandb.finish()
 
 if __name__ == "__main__":
     main()

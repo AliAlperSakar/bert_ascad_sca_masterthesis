@@ -10,6 +10,8 @@ import h5py
 import wandb
 from tqdm import tqdm
 import random
+import math
+from pathlib import Path
 
 def set_seed(seed):
     """Set random seed for reproducibility"""
@@ -120,26 +122,107 @@ def collate_fn(batch):
     }
     return collated
 
+class EarlyStopping:
+    """Early stopping to prevent overfitting"""
+    def __init__(self, patience=7, min_delta=0, restore_best_weights=True):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.restore_best_weights = restore_best_weights
+        self.best_loss = None
+        self.counter = 0
+        self.best_weights = None
+        
+    def __call__(self, val_loss, model):
+        if self.best_loss is None:
+            self.best_loss = val_loss
+            self.best_weights = model.state_dict().copy()
+        elif val_loss < self.best_loss - self.min_delta:
+            self.best_loss = val_loss
+            self.counter = 0
+            self.best_weights = model.state_dict().copy()
+        else:
+            self.counter += 1
+            
+        if self.counter >= self.patience:
+            if self.restore_best_weights:
+                model.load_state_dict(self.best_weights)
+            return True
+        return False
+
 class BERT_SCA_Model(nn.Module):
-    def __init__(self, bert_model, trace_length):
+    def __init__(self, bert_model, trace_length, dropout_rate=0.2):
         super(BERT_SCA_Model, self).__init__()
         self.bert = bert_model
-        self.dropout = nn.Dropout(0.1)
+        # Freeze BERT layers to prevent overfitting (optional)
+        # for param in self.bert.parameters():
+        #     param.requires_grad = False
+        
+        # Increased dropout for better regularization
+        self.dropout = nn.Dropout(dropout_rate)
+        self.dropout2 = nn.Dropout(dropout_rate)
+        
         # Map trace features to 768-dim to match BERT's output size
         self.trace_fc = nn.Linear(trace_length, 768)
+        self.trace_bn = nn.BatchNorm1d(768)  # Batch normalization for stability
+        
+        # Add an intermediate layer for better feature learning
+        self.intermediate = nn.Linear(768 * 2, 512)
+        self.intermediate_bn = nn.BatchNorm1d(512)
+        
         # Concatenate [BERT_output, trace_features] and classify to 256 classes
-        self.classifier = nn.Linear(768 * 2, 256)
+        self.classifier = nn.Linear(512, 256)
 
     def forward(self, input_ids, attention_mask, traces):
         bert_outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
         bert_output = bert_outputs.pooler_output  # (batch_size, 768)
+        
+        # Apply dropout to BERT output
+        bert_output = self.dropout(bert_output)
+        
         trace_features = self.trace_fc(traces)     # (batch_size, 768)
+        trace_features = self.trace_bn(trace_features)
+        trace_features = self.dropout(trace_features)
+        
         combined = torch.cat((bert_output, trace_features), dim=1)
-        x = self.dropout(combined)
-        logits = self.classifier(x)
+        
+        # Intermediate layer with batch norm and dropout
+        intermediate = self.intermediate(combined)
+        intermediate = self.intermediate_bn(intermediate)
+        intermediate = torch.relu(intermediate)
+        intermediate = self.dropout2(intermediate)
+        
+        logits = self.classifier(intermediate)
         return logits
 
+def verify_disjoint_plaintexts_and_keys(h5_file_path):
+    with h5py.File(h5_file_path, 'r') as f:
+        profiling_metadata = f['Profiling_traces/metadata'][:]
+        attack_metadata = f['Attack_traces/metadata'][:]
+        
+        profiling_plaintexts = {tuple(pt) for pt in profiling_metadata['plaintext']}
+        attack_plaintexts = {tuple(pt) for pt in attack_metadata['plaintext']}
+        profiling_keys = {tuple(k) for k in profiling_metadata['key']}
+        attack_keys = {tuple(k) for k in attack_metadata['key']}
+        
+        overlap_plaintext = profiling_plaintexts & attack_plaintexts
+        overlap_key = profiling_keys & attack_keys
+        
+        print("🔍 Checking for overlap between profiling and attack sets...")
+        if overlap_plaintext:
+            print(f"⚠️ Warning: {len(overlap_plaintext)} overlapping plaintexts found!")
+        else:
+            print("✅ No overlapping plaintexts.")
+
+        if overlap_key:
+            print(f"⚠️ Warning: {len(overlap_key)} overlapping keys found!")
+        else:
+            print("✅ No overlapping keys.")
+
 def train_model(args):
+    # Create output directory
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
     # Initialize WandB for experiment logging
     # Dynamically build project and run names
     dataset_name = os.path.basename(args.dataset_path).split('.')[0]
@@ -147,6 +230,7 @@ def train_model(args):
     run_name = (
         f"{dataset_name}_e{args.epochs}_bs{args.batch_size}_lr{args.learning_rate:.0e}"
         f"{'_ds' + str(args.downsample) if args.downsample else ''}"
+        f"_seed{args.seed}"
     )
 
     wandb.init(
@@ -161,16 +245,25 @@ def train_model(args):
             "embedding": "hex",
             "backbone": "bert-base-uncased",
             "trace_net": "fc",
-            "fusion": "concat"
+            "fusion": "concat",
+            "weight_decay": args.weight_decay,
+            "gradient_clip": args.gradient_clip,
+            "early_stopping_patience": args.early_stopping_patience,
+            "dropout_rate": args.dropout_rate
         }
     )
 
     # Load the dataset
     (X_profiling, Y_profiling, plaintexts_profiling), (X_attack, Y_attack, plaintexts_attack), profiling_mean, profiling_std = load_ascad_data(args.dataset_path, downsample=args.downsample)
-    # Save the profiling mean and std
-    np.save('profiling_mean.npy', profiling_mean)
-    np.save('profiling_std.npy', profiling_std)
+    # Save the profiling mean and std to output directory
+    np.save(output_dir / 'profiling_mean.npy', profiling_mean)
+    np.save(output_dir / 'profiling_std.npy', profiling_std)
     print("✅ Profiling mean and std saved for consistent evaluation.")
+
+    # After loading X_profiling, Y_profiling, plaintexts_profiling
+    if args.randomize_labels:
+        print("Randomizing labels for sanity check!")
+        np.random.shuffle(Y_profiling)
 
     trace_length = X_profiling.shape[1]
 
@@ -180,17 +273,30 @@ def train_model(args):
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4, collate_fn=collate_fn)
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size, num_workers=4, collate_fn=collate_fn)
 
-    # Initialize model
+    # Initialize model with improved architecture
     bert_model = BertModel.from_pretrained('bert-base-uncased')
-    model = BERT_SCA_Model(bert_model, trace_length).to(DEVICE)
+    model = BERT_SCA_Model(bert_model, trace_length, dropout_rate=args.dropout_rate).to(DEVICE)
 
-    # Loss, optimizer, scheduler
+    # Loss, optimizer with weight decay, scheduler
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
+    optimizer = optim.AdamW(
+        model.parameters(), 
+        lr=args.learning_rate, 
+        weight_decay=args.weight_decay,
+        eps=1e-8
+    )
     total_steps = len(train_loader) * args.epochs
-    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=int(0.1 * total_steps), num_training_steps=total_steps)
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer, 
+        num_warmup_steps=int(0.1 * total_steps), 
+        num_training_steps=total_steps
+    )
+
+    # Initialize early stopping
+    early_stopping = EarlyStopping(patience=args.early_stopping_patience)
 
     # Training loop
+    best_val_loss = float('inf')
     for epoch in range(args.epochs):
         model.train()
         train_loss = 0.0
@@ -207,6 +313,10 @@ def train_model(args):
             outputs = model(input_ids, attention_mask, traces)
             loss = criterion(outputs, labels)
             loss.backward()
+            
+            # Gradient clipping to prevent exploding gradients
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.gradient_clip)
+            
             optimizer.step()
             scheduler.step()
 
@@ -246,17 +356,33 @@ def train_model(args):
             "train_loss": train_loss,
             "train_acc": train_acc,
             "val_loss": val_loss,
-            "val_acc": val_acc
+            "val_acc": val_acc,
+            "learning_rate": scheduler.get_last_lr()[0]
         })
         print(f"Epoch {epoch+1}: Train Loss: {train_loss:.4f} (Acc: {train_acc:.2f}%), Val Loss: {val_loss:.4f} (Acc: {val_acc:.2f}%)")
 
-    # Save trained model
-    model_save_path = f"bert_sca_{os.path.basename(args.dataset_path).split('.')[0]}_seed{args.seed}_e{args.epochs}_lr{args.learning_rate:.0e}_s{args.downsample if args.downsample else 'full'}.pth"
+        # Early stopping check
+        if early_stopping(val_loss, model):
+            print(f"Early stopping triggered at epoch {epoch+1}")
+            break
+
+        # Save best model
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_model_filename = f"best_bert_sca_{os.path.basename(args.dataset_path).split('.')[0]}_seed{args.seed}.pth"
+            best_model_path = output_dir / best_model_filename
+            torch.save(model.state_dict(), best_model_path)
+            print(f"✅ New best model saved: {best_model_path}")
+
+    # Save final trained model
+    model_filename = f"bert_sca_{os.path.basename(args.dataset_path).split('.')[0]}_seed{args.seed}_e{args.epochs}_lr{args.learning_rate:.0e}_s{args.downsample if args.downsample else 'full'}.pth"
+    model_save_path = output_dir / model_filename
     torch.save(model.state_dict(), model_save_path)
     print(f"Model saved to {model_save_path}")
 
     # Save config
-    config_save_path = model_save_path.replace(".pth", "_config.yaml")
+    config_filename = model_filename.replace(".pth", "_config.yaml")
+    config_save_path = output_dir / config_filename
     config_dict = {
         "dataset_path": args.dataset_path,
         "epochs": args.epochs,
@@ -270,8 +396,12 @@ def train_model(args):
         "key_byte": 0,
         "num_traces": 10000,
         "random_seed": args.seed,  # Add seed to config
-        "profiling_mean_path": 'profiling_mean.npy',
-        "profiling_std_path": 'profiling_std.npy'
+        "profiling_mean_path": str(output_dir / 'profiling_mean.npy'),
+        "profiling_std_path": str(output_dir / 'profiling_std.npy'),
+        "weight_decay": args.weight_decay,
+        "gradient_clip": args.gradient_clip,
+        "early_stopping_patience": args.early_stopping_patience,
+        "dropout_rate": args.dropout_rate
     }
 
     import yaml
@@ -284,14 +414,23 @@ def train_model(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train BERT SCA model on ASCAD dataset")
     parser.add_argument("--dataset_path", type=str, required=True, help="Path to the ASCAD dataset (.h5 file)")
-    parser.add_argument("--epochs", type=int, default=20, help="Number of training epochs")
+    parser.add_argument("--epochs", type=int, default=5, help="Number of training epochs")
     parser.add_argument("--batch_size", type=int, default=64, help="Batch size for training")
     parser.add_argument("--learning_rate", type=float, default=1e-4, help="Learning rate for training")
     parser.add_argument("--downsample", type=int, default=None, help="Optional downsampling size of the profiling set")
     parser.add_argument("--seed", type=int, default=222, help="Random seed for reproducibility")
+    parser.add_argument("--output_dir", type=str, default=".", help="Directory to save models and configs")
+    parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay for regularization")
+    parser.add_argument("--gradient_clip", type=float, default=1.0, help="Gradient clipping norm")
+    parser.add_argument("--early_stopping_patience", type=int, default=7, help="Early stopping patience")
+    parser.add_argument("--dropout_rate", type=float, default=0.2, help="Dropout rate for regularization")
+    parser.add_argument("--randomize_labels", action="store_true", help="Randomize labels for sanity check")
     args = parser.parse_args()
     
     # Set the random seed
     set_seed(args.seed)
+
+    # Verify disjoint plaintexts and keys after args is defined
+    verify_disjoint_plaintexts_and_keys(args.dataset_path)
     
     train_model(args)
