@@ -6,6 +6,7 @@ from pathlib import Path
 import csv
 from datetime import datetime
 import re
+import argparse
 
 def parse_metrics_from_output(output):
     metrics = {}
@@ -34,7 +35,7 @@ CSV_HEADER = [
 
 CSV_PATH = "key_byte_results/test_results.csv"
 
-def run_test_for_byte(key_byte, model_path, dataset_path):
+def run_test_for_byte(key_byte, model_path, dataset_path, ablation=None):
     cmd = [
         "python",
         "/root/alper/jupyter_transfer/downloaded_data/work/BERT/ASCAD_all_latest/test_ascad_bert_improved.py",
@@ -42,6 +43,8 @@ def run_test_for_byte(key_byte, model_path, dataset_path):
         "--model_path", model_path,
         "--key_byte", str(key_byte)
     ]
+    if ablation:
+        cmd += ["--ablation", ablation]
     print(f"\n{'='*80}")
     print(f"Testing key byte {key_byte}")
     print(f"{'='*80}\n")
@@ -80,12 +83,15 @@ def run_test_for_byte(key_byte, model_path, dataset_path):
     return status == "SUCCESS"
 
 def main():
+    parser = argparse.ArgumentParser(description="Batch test all key bytes with optional ablation.")
+    parser.add_argument("--ablation", type=str, default=None, choices=[None, "no_dropout", "no_posenc", "no_fusion", "tiny_emb"], help="Ablation variant to run (optional)")
+    args = parser.parse_args()
     results_dir = Path("key_byte_results")
     results_dir.mkdir(exist_ok=True)
-    model_path = "/root/alper/jupyter_transfer/downloaded_data/work/BERT/ASCAD_all_latest/experiments/best_seeds/seed_42_bs64_lr5e-5/bert_sca_ascad-variable_seed42_e20_lr5e-05_s50000.pth"
+    model_path = "/root/alper/jupyter_transfer/downloaded_data/work/BERT/ASCAD_all_latest/experiments/cutting_edge/seed_42_bs256_lr8e-4/bert_sca_ascad-variable_seed42_e150_lr8e-04_s30000_20250708_001348.pth"
     dataset_path = "/root/alper/jupyter_transfer/downloaded_data/data/ASCAD_all/Variable-Key/ascad-variable.h5"
     for key_byte in range(16):
-        success = run_test_for_byte(key_byte, model_path, dataset_path)
+        success = run_test_for_byte(key_byte, model_path, dataset_path, ablation=args.ablation)
         time.sleep(2)
 
 if __name__ == "__main__":

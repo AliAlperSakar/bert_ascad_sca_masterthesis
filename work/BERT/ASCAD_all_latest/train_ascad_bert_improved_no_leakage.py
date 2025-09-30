@@ -403,7 +403,7 @@ def train_model(args):
             loss.backward()
 
             # Gradient clipping
-            torch.nn.utils.clip_grad_norm(model.parameters(), args.gradient_clip)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.gradient_clip)
 
             optimizer.step()
             scheduler.step()
