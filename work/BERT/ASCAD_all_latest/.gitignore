@@ -1,0 +1,23 @@
+# Large artifacts and experiment outputs
+models/**
+!models/README.md
+**/*.pth
+**/*.pt
+**/*.h5
+**/*.npy
+**/*.npz
+wandb/**
+**/experiment_results/**
+**/outputs/**
+**/ablation_results_final/**
+**/proportional_validation_experiment_*/**
+**/leak_free_experiments/**
+**/data/**
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Notebooks checkpoints
+.ipynb_checkpoints/
