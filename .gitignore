@@ -1,0 +1,20 @@
+# Ignore all files under DPAv2/v2_public_database
+/data/DPAv2/v2_public_database/ 
+
+# Ignore DPAv2 data
+/DPAv2/ 
+# Large artifacts and experiment outputs (repo root)
+work/BERT/ASCAD_all_latest/models/**
+!work/BERT/ASCAD_all_latest/models/README.md
+work/BERT/ASCAD_all_latest/**/ablation_results_final/**
+work/BERT/ASCAD_all_latest/proportional_validation_experiment_*/**
+work/BERT/ASCAD_all_latest/leak_free_experiments/**
+work/BERT/ASCAD_all_latest/wandb/**
+work/BERT/ASCAD_all_latest/**/outputs/**
+work/BERT/ASCAD_all_latest/**/experiment_results/**
+work/BERT/ASCAD_all_latest/**/data/**
+work/BERT/ASCAD_all_latest/**/*.pth
+work/BERT/ASCAD_all_latest/**/*.pt
+work/BERT/ASCAD_all_latest/**/*.h5
+work/BERT/ASCAD_all_latest/**/*.npy
+work/BERT/ASCAD_all_latest/**/*.npz
