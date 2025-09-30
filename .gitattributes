@@ -1,0 +1,5 @@
+work/BERT/ASCAD_all_latest/**/*.npy filter=lfs diff=lfs merge=lfs -text
+work/BERT/ASCAD_all_latest/**/*.npz filter=lfs diff=lfs merge=lfs -text
+work/BERT/ASCAD_all_latest/**/*.pth filter=lfs diff=lfs merge=lfs -text
+work/BERT/ASCAD_all_latest/**/*.pt filter=lfs diff=lfs merge=lfs -text
+work/BERT/ASCAD_all_latest/**/*.h5 filter=lfs diff=lfs merge=lfs -text
